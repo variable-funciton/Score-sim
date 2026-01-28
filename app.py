@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import japanize_matplotlib
+import matplotlib_fontja
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -109,3 +109,4 @@ if st.download_button(
     mime="application/pdf",
 ):
     st.balloons()
+
