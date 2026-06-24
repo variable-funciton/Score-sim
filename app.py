@@ -61,16 +61,16 @@ st.divider()
 st.header("📊 計算結果")
 
 res_col1, res_col2, res_col3 = st.columns(3)
-res_col1.metric("前期総合成績", f"{zenki_score:.1f} 点")
-res_col2.metric("後期総合成績", f"{kouki_score:.1f} 点")
+res_col1.metric("前期総合成績", f"{zenki_score:.2f} 点")
+res_col2.metric("後期総合成績", f"{kouki_score:.2f} 点")
 
 # 通年成績の判定と表示
 if final_score >= 60:
-    res_col3.metric("通年成績", f"{final_score:.1f} 点", delta="合格", delta_color="normal")
-    st.success(f"最終結果: 合格 ({final_score:.1f} 点)")
+    res_col3.metric("通年成績", f"{final_score:.2f} 点", delta="合格", delta_color="normal")
+    st.success(f"最終結果: 合格 ({final_score:.2f} 点)")
 else:
-    res_col3.metric("通年成績", f"{final_score:.1f} 点", delta="- 不合格", delta_color="inverse")
-    st.error(f"最終結果: 単位取得にはあと {60.0 - final_score:.1f} 点必要です。")
+    res_col3.metric("通年成績", f"{final_score:.2f} 点", delta="- 不合格", delta_color="inverse")
+    st.error(f"最終結果: 単位取得にはあと {60.0 - final_score:.2f} 点必要です。")
 
 # --- PDF生成（画像埋め込み） ---
 def create_pdf(fig_data):
@@ -83,10 +83,10 @@ def create_pdf(fig_data):
     p.drawString(50, h - 50, "成績レポート")
     
     p.setFont("HeiseiKakuGo-W5", 14)
-    p.drawString(50, h - 100, f"前期総合成績: {zenki_score:.1f} 点, 前期課題: {y1:.1f}点")
-    p.drawString(50, h - 120, f"後期総合成績: {kouki_score:.1f} 点, 後期課題: {y2:.1f}点")
+    p.drawString(50, h - 100, f"前期総合成績: {zenki_score:.2f} 点, 前期課題: {y1:.2f}点")
+    p.drawString(50, h - 120, f"後期総合成績: {kouki_score:.2f} 点, 後期課題: {y2:.2f}点")
     p.setFont("HeiseiKakuGo-W5", 16)
-    p.drawString(50, h - 150, f"総合成績: {final_score:.1f} 点")
+    p.drawString(50, h - 150, f"総合成績: {final_score:.2f} 点")
     
     status = "合格" if final_score >= 60 else "不合格"
     p.drawString(50, h - 180, f"単位認定の可否: {status}")
