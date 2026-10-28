@@ -1,112 +1,278 @@
+from io import BytesIO
 
-import streamlit as st
-import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib_fontja
-from reportlab.pdfgen import canvas
+import matplotlib_fontja  # noqa: F401  (matplotlib の日本語化)
+import streamlit as st
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
-# --- 日本語フォント設定用の追加 ---
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from io import BytesIO
-# 日本語フォント（平成角ゴシック）を登録
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+from reportlab.pdfgen import canvas
+
+from grading import (PASS_LINE, PATTERNS, RETEST_LINE, compute, exam_names,
+                     judge, need_text, outlook, term_names)
+
+pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
 
 st.set_page_config(page_title="成績シミュレーター", layout="centered")
 
-st.title("成績評価シミュレーション")
+RED, AMBER, GREEN = "#e57373", "#ffb74d", "#81c784"
 
-# --- 入力セクション ---
+# ---------------------------------------------------------------------------
+# 科目設定（URL のクエリパラメータから初期値を読み、変更したら URL に書き戻す）
+#   例: https://score2026.streamlit.app/?pattern=half2&ratio=80
+# ---------------------------------------------------------------------------
+qp = st.query_params
+if "pattern" not in st.session_state:
+    p = qp.get("pattern", "full4")
+    st.session_state.pattern = p if p in PATTERNS else "full4"
+if "ratio" not in st.session_state:
+    try:
+        st.session_state.ratio = min(100, max(0, int(qp.get("ratio", 70))))
+    except ValueError:
+        st.session_state.ratio = 70
+
 with st.sidebar:
-    st.header("配点設定")
-    paper_ratio = st.slider("筆記試験の割合 (%)", 0, 100, 70)
+    st.header("科目の設定")
+    pattern = st.radio("試験のパターン", list(PATTERNS),
+                       format_func=lambda k: PATTERNS[k][0], key="pattern")
+    paper_ratio = st.slider("筆記試験の割合 (%)", 0, 100, key="ratio")
     assignment_limit = 100 - paper_ratio
-    st.sidebar.info(f"現在の設定:\n- 筆記試験: {paper_ratio}%\n- 課題等: {assignment_limit}%")
+    st.info(f"筆記試験: {paper_ratio}%　／　課題等: {assignment_limit} 点満点（各期）")
+    st.caption("この画面の URL をそのまま共有すると、同じ科目設定で開けます。")
 
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📅 前期")
-    x1 = st.number_input("前期中間", 0.0, 100.0, 60.0)
-    x2 = st.number_input("前期期末", 0.0, 100.0, 60.0)
-    y1 = st.number_input(f"前期課題(最大{assignment_limit})", 0.0, float(assignment_limit), 0.0)
+    with st.expander("判定基準"):
+        st.markdown(
+            f"- **{PASS_LINE:.0f} 点以上**：合格\n"
+            f"- **{RETEST_LINE:.0f} 点以上 {PASS_LINE:.0f} 点未満**：再試験"
+            f"（再試験で {PASS_LINE:.0f} 点未満なら不合格）\n"
+            f"- **{RETEST_LINE:.0f} 点未満**：不合格（再試験なし）"
+        )
 
-with col2:
-    st.subheader("📅 後期")
-    x3 = st.number_input("後期中間", 0.0, 100.0, 60.0)
-    x4 = st.number_input("後期期末", 0.0, 100.0, 60.0)
-    y2 = st.number_input(f"後期課題(最大{assignment_limit})", 0.0, float(assignment_limit), 0.0)
+st.query_params.update({"pattern": pattern, "ratio": str(paper_ratio)})
+ratio = paper_ratio / 100
 
-# --- 計算 ---
-zenki_score = ((x1 + x2) / 2 * paper_ratio / 100) + y1
-kouki_score = ((x3 + x4) / 2 * paper_ratio / 100) + y2
-final_score = (zenki_score + kouki_score) / 2
+st.title("🧭 成績シミュレーター")
+st.caption("試験の点数と課題点を入力してください。まだ受けていない試験は「未実施」に"
+           "チェックを入れると、単位取得に必要な点数を逆算します。")
 
-# --- 可視化（Matplotlibを使用して画像化） ---
+# ---------------------------------------------------------------------------
+# 入力
+# ---------------------------------------------------------------------------
+terms = PATTERNS[pattern][1]
+exams: dict[str, float] = {}
+pending: list[str] = []
+assignments: dict[str, float] = {}
+over_limit = []
+
+cols = st.columns(len(terms))
+for col, (term, names) in zip(cols, terms):
+    with col:
+        st.subheader(f"📅 {term}")
+        for name in names:
+            done = not st.checkbox(f"{name}は未実施", key=f"pend_{name}")
+            exams[name] = st.number_input(f"{name}試験", 0.0, 100.0, 60.0, step=1.0,
+                                          key=f"exam_{name}", disabled=not done)
+            if not done:
+                pending.append(name)
+        # ラベルと上限を固定して key を付けることで、割合を変えても入力が消えないようにする
+        y = st.number_input(f"{term}課題点（見込みでも可）", 0.0, 100.0, 0.0, step=1.0,
+                            key=f"assign_{term}")
+        if y > assignment_limit:
+            over_limit.append(term)
+            y = float(assignment_limit)
+        assignments[term] = y
+
+if over_limit:
+    st.warning(f"{'・'.join(over_limit)}の課題点が上限 {assignment_limit} 点を超えているため、"
+               f"{assignment_limit} 点として計算しています。")
+
+
+# ---------------------------------------------------------------------------
+# 図
+# ---------------------------------------------------------------------------
+def to_png(fig) -> bytes:
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def shade_zones(ax, horizontal: bool):
+    span = ax.axvspan if horizontal else ax.axhspan
+    span(0, RETEST_LINE, color=RED, alpha=0.25, lw=0)
+    span(RETEST_LINE, PASS_LINE, color=AMBER, alpha=0.25, lw=0)
+    span(PASS_LINE, 100, color=GREEN, alpha=0.25, lw=0)
+
+
+def gauge(score: float, low: float | None = None, high: float | None = None) -> bytes:
+    """総合成績の位置を示す横長のゲージ. low〜high は取りうる範囲."""
+    fig, ax = plt.subplots(figsize=(6.5, 1.3))
+    shade_zones(ax, horizontal=True)
+    for x, label in [(RETEST_LINE / 2, "再試験なし"), ((RETEST_LINE + PASS_LINE) / 2, "再試験"),
+                     ((PASS_LINE + 100) / 2, "合格")]:
+        ax.text(x, 0.82, label, ha="center", va="center", fontsize=9, color="#444")
+    if low is not None and high is not None:
+        ax.plot([low, high], [0.4, 0.4], color="#555", lw=6, alpha=0.35, solid_capstyle="butt")
+        ax.text(low, 0.12, f"{low:.1f}", ha="center", fontsize=8, color="#555")
+        ax.text(high, 0.12, f"{high:.1f}", ha="center", fontsize=8, color="#555")
+    ax.plot([score], [0.4], marker="v", markersize=14, color="#1a237e")
+    ax.text(score, 0.62, f"{score:.1f}", ha="center", fontsize=10, color="#1a237e",
+            fontweight="bold")
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([])
+    ax.set_xticks([0, RETEST_LINE, PASS_LINE, 100])
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    return to_png(fig)
+
+
+def outlook_chart(o, t_now: float) -> bytes:
+    """残り試験の平均点 t と総合成績の関係（一次関数）."""
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    shade_zones(ax, horizontal=False)
+    ax.plot([0, 100], [o.floor, o.ceiling], color="#1a237e", lw=2)
+    for need, line, color in [(o.need_retest, RETEST_LINE, "#ef6c00"),
+                              (o.need_pass, PASS_LINE, "#2e7d32")]:
+        if need is not None and need != float("inf"):
+            ax.plot([need, need], [0, line], ls="--", color=color, lw=1.2)
+            ax.plot([need], [line], "o", color=color)
+            ax.annotate(f"{need:.1f} 点", (need, line), textcoords="offset points",
+                        xytext=(6, -14), color=color, fontsize=9)
+    ax.plot([t_now], [o.at(t_now)], marker="*", markersize=16, color="#d81b60",
+            label=f"見込み {t_now:.0f} 点 → 総合 {o.at(t_now):.1f} 点")
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("残りの試験の平均点")
+    ax.set_ylabel("総合成績")
+    ax.grid(True, ls=":", alpha=0.6)
+    ax.legend(loc="upper left", fontsize=9)
+    return to_png(fig)
+
+
+def show_status(label: str, kind: str, score: float, prefix: str):
+    msg = f"{prefix}：**{score:.2f} 点** → {label}"
+    {"success": st.success, "warning": st.warning, "error": st.error}[kind](msg)
+
+
+# ---------------------------------------------------------------------------
+# 結果
+# ---------------------------------------------------------------------------
 st.divider()
-st.subheader("📊 筆記試験得点の推移")
+report_lines: list[str] = []
+pngs: list[bytes] = []
 
-labels = ["前期中間試験", "前期期末試験", "後期中間試験", "後期期末試験"]
-scores = [x1, x2, x3, x4]
+if not pending:
+    total, term_scores = compute(pattern, exams, assignments, ratio)
+    label, kind = judge(total)
 
-fig, ax = plt.subplots(figsize=(6, 4))
-ax.plot(labels, scores, marker='o', linestyle='-', color='#007bff')
-ax.set_ylim(0, 105)
-ax.set_ylabel("得点")
-ax.grid(True, linestyle='--', alpha=0.6)
-st.pyplot(fig)
+    st.header("📊 計算結果")
+    mcols = st.columns(len(term_scores) + 1)
+    for c, (term, s) in zip(mcols, term_scores.items()):
+        c.metric(f"{term}の成績", f"{s:.2f} 点")
+    mcols[-1].metric("総合成績", f"{total:.2f} 点")
+    show_status(label, kind, total, "総合成績")
+    if kind == "warning":
+        st.info(f"あと {PASS_LINE - total:.2f} 点で合格ラインでした。再試験に向けて準備しましょう。")
 
-# 結果表示
-st.divider()
-st.header("📊 計算結果")
+    png = gauge(total)
+    st.image(png)
+    pngs.append(png)
 
-res_col1, res_col2, res_col3 = st.columns(3)
-res_col1.metric("前期総合成績", f"{zenki_score:.2f} 点")
-res_col2.metric("後期総合成績", f"{kouki_score:.2f} 点")
+    report_lines += [f"{t}の成績: {s:.2f} 点" for t, s in term_scores.items()]
+    report_lines += [f"総合成績: {total:.2f} 点", f"判定: {label}"]
 
-# 通年成績の判定と表示
-if final_score >= 60:
-    res_col3.metric("通年成績", f"{final_score:.2f} 点", delta="合格", delta_color="normal")
-    st.success(f"最終結果: 合格 ({final_score:.2f} 点)")
 else:
-    res_col3.metric("通年成績", f"{final_score:.2f} 点", delta="- 不合格", delta_color="inverse")
-    st.error(f"最終結果: 単位取得にはあと {60.0 - final_score:.2f} 点必要です。")
+    o = outlook(pattern, exams, pending, assignments, ratio)
 
-# --- PDF生成（画像埋め込み） ---
-def create_pdf(fig_data):
-    buffer = BytesIO()
-    p = canvas.Canvas(buffer, pagesize=A4)
+    st.header("🧭 単位取得までの目標")
+    st.write(f"未実施の試験：**{'・'.join(pending)}**（{len(pending)} 回）")
+
+    c1, c2 = st.columns(2)
+    c1.metric("合格（60点）に必要な点", need_text(o.need_pass))
+    c2.metric("再試験の資格（40点）に必要な点", need_text(o.need_retest))
+    st.caption("「平均◯点以上」は、残りの試験の平均点です。残りが1回ならその試験の点数です。")
+
+    if o.need_pass is None:
+        st.success("残りの試験が0点でも総合成績は60点以上です。気を抜かずに受けましょう。")
+    elif o.need_pass == float("inf"):
+        if o.need_retest == float("inf"):
+            st.error("残りの試験が満点でも総合成績は40点に届きません。"
+                     "早めに担当の先生・担任の先生に相談してください。")
+        else:
+            st.warning("残りの試験が満点でも60点には届きません。"
+                       f"再試験の資格（40点以上）を確実に取りにいきましょう（{need_text(o.need_retest)}）。")
+    else:
+        st.info(f"残りの試験で **{need_text(o.need_pass)}** を取れば合格です。")
+
+    st.subheader("見込みで試算する")
+    t_now = st.slider("残りの試験で取れそうな平均点", 0, 100, 60, key="expect")
+    predicted = o.at(t_now)
+    label, kind = judge(predicted)
+    show_status(label, kind, predicted, f"平均 {t_now} 点のときの総合成績")
+
+    png1 = gauge(predicted, o.floor, o.ceiling)
+    st.image(png1)
+    st.caption(f"灰色の帯は取りうる総合成績の範囲（残り0点：{o.floor:.1f} 点 〜 残り満点：{o.ceiling:.1f} 点）")
+    png2 = outlook_chart(o, t_now)
+    with st.expander("残りの試験の点数と総合成績の関係（グラフ）"):
+        st.image(png2)
+    pngs += [png1, png2]
+
+    report_lines += [
+        f"未実施の試験: {'・'.join(pending)}",
+        f"合格(60点)に必要な点: {need_text(o.need_pass)}",
+        f"再試験資格(40点)に必要な点: {need_text(o.need_retest)}",
+        f"見込み平均 {t_now} 点の場合の総合成績: {predicted:.2f} 点（{label}）",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# PDF
+# ---------------------------------------------------------------------------
+def create_pdf() -> bytes:
+    buf = BytesIO()
+    p = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
-
-    # テキスト情報
+    y = h - 50
     p.setFont("HeiseiKakuGo-W5", 20)
-    p.drawString(50, h - 50, "成績レポート")
-    
-    p.setFont("HeiseiKakuGo-W5", 14)
-    p.drawString(50, h - 100, f"前期総合成績: {zenki_score:.2f} 点, 前期課題: {y1:.2f}点")
-    p.drawString(50, h - 120, f"後期総合成績: {kouki_score:.2f} 点, 後期課題: {y2:.2f}点")
-    p.setFont("HeiseiKakuGo-W5", 16)
-    p.drawString(50, h - 150, f"総合成績: {final_score:.2f} 点")
-    
-    status = "合格" if final_score >= 60 else "不合格"
-    p.drawString(50, h - 180, f"単位認定の可否: {status}")
-
-    # グラフ画像をPDFに貼り付け
-    img_buffer = BytesIO()
-    fig_data.savefig(img_buffer, format='png', bbox_inches='tight')
-    img_buffer.seek(0)
-    p.drawImage(ImageReader(img_buffer), 50, h - 600, width = 500, preserveAspectRatio=True)
-
+    p.drawString(50, y, "成績シミュレーション結果")
+    y -= 35
+    p.setFont("HeiseiKakuGo-W5", 11)
+    p.drawString(50, y, f"試験パターン: {PATTERNS[pattern][0]}　筆記試験の割合: {paper_ratio}%")
+    y -= 25
+    for name in exam_names(pattern):
+        val = "未実施" if name in pending else f"{exams[name]:.0f} 点"
+        p.drawString(60, y, f"{name}: {val}")
+        y -= 17
+    for term in term_names(pattern):
+        p.drawString(60, y, f"{term}課題点: {assignments[term]:.1f} 点")
+        y -= 17
+    y -= 10
+    p.setFont("HeiseiKakuGo-W5", 13)
+    for line in report_lines:
+        p.drawString(50, y, line)
+        y -= 22
+    y -= 10
+    for png in pngs:
+        img = ImageReader(BytesIO(png))
+        iw, ih = img.getSize()
+        dw = 480
+        dh = dw * ih / iw
+        if y - dh < 40:
+            p.showPage()
+            y = h - 50
+        p.drawImage(img, 50, y - dh, width=dw, height=dh)
+        y -= dh + 15
+    p.setFont("HeiseiKakuGo-W5", 9)
+    p.drawString(50, 30, "※この結果は入力値にもとづく試算です。正式な成績は担当教員の評価によります。")
     p.showPage()
     p.save()
-    return buffer.getvalue()
+    return buf.getvalue()
+
 
 st.divider()
-if st.download_button(
-    label="📈 グラフ付きPDFをダウンロード",
-    data=create_pdf(fig),
-    file_name="grade_report_with_chart.pdf",
-    mime="application/pdf",
-):
-    st.balloons()
-
+st.download_button("📄 結果をPDFでダウンロード", data=create_pdf(),
+                   file_name="grade_simulation.pdf", mime="application/pdf")
+st.caption("入力した点数はこの画面の中だけで計算に使われ、保存されません。")
