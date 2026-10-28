@@ -1,5 +1,2 @@
 streamlit
-pandas
-matplotlib
-matplotlib-fontja
-reportlab
+plotly

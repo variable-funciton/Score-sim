@@ -1,22 +1,13 @@
-from io import BytesIO
+import math
 
-import matplotlib.pyplot as plt
-import matplotlib_fontja  # noqa: F401  (matplotlib の日本語化)
 import streamlit as st
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.pdfgen import canvas
 
+from charts import CONFIG, gauge, outlook_chart
 from grading import (PASS_LINE, PATTERNS, RETEST_LINE, compute, exam_names,
                      judge, need_text, outlook, term_names)
-
-pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+from report import build_html
 
 st.set_page_config(page_title="成績シミュレーター", layout="centered")
-
-RED, AMBER, GREEN = "#e57373", "#ffb74d", "#81c784"
 
 # ---------------------------------------------------------------------------
 # 科目設定（URL のクエリパラメータから初期値を読み、変更したら URL に書き戻す）
@@ -87,81 +78,25 @@ if over_limit:
     st.warning(f"{'・'.join(over_limit)}の課題点が上限 {assignment_limit} 点を超えているため、"
                f"{assignment_limit} 点として計算しています。")
 
-
 # ---------------------------------------------------------------------------
-# 図
+# 結果（画面に表示しながら、HTML レポートの中身も集める）
 # ---------------------------------------------------------------------------
-def to_png(fig) -> bytes:
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
+results: list[tuple[str, str]] = []
+verdicts: list[tuple[str, str]] = []
+figures = []
 
 
-def shade_zones(ax, horizontal: bool):
-    span = ax.axvspan if horizontal else ax.axhspan
-    span(0, RETEST_LINE, color=RED, alpha=0.25, lw=0)
-    span(RETEST_LINE, PASS_LINE, color=AMBER, alpha=0.25, lw=0)
-    span(PASS_LINE, 100, color=GREEN, alpha=0.25, lw=0)
+def say(kind: str, msg: str):
+    """画面にメッセージを出し、レポートにも残す."""
+    {"success": st.success, "warning": st.warning, "error": st.error, "info": st.info}[kind](msg)
+    verdicts.append((kind, msg))
 
 
-def gauge(score: float, low: float | None = None, high: float | None = None) -> bytes:
-    """総合成績の位置を示す横長のゲージ. low〜high は取りうる範囲."""
-    fig, ax = plt.subplots(figsize=(6.5, 1.3))
-    shade_zones(ax, horizontal=True)
-    for x, label in [(RETEST_LINE / 2, "再試験なし"), ((RETEST_LINE + PASS_LINE) / 2, "再試験"),
-                     ((PASS_LINE + 100) / 2, "合格")]:
-        ax.text(x, 0.82, label, ha="center", va="center", fontsize=9, color="#444")
-    if low is not None and high is not None:
-        ax.plot([low, high], [0.4, 0.4], color="#555", lw=6, alpha=0.35, solid_capstyle="butt")
-        ax.text(low, 0.12, f"{low:.1f}", ha="center", fontsize=8, color="#555")
-        ax.text(high, 0.12, f"{high:.1f}", ha="center", fontsize=8, color="#555")
-    ax.plot([score], [0.4], marker="v", markersize=14, color="#1a237e")
-    ax.text(score, 0.62, f"{score:.1f}", ha="center", fontsize=10, color="#1a237e",
-            fontweight="bold")
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([])
-    ax.set_xticks([0, RETEST_LINE, PASS_LINE, 100])
-    for s in ("top", "right", "left"):
-        ax.spines[s].set_visible(False)
-    return to_png(fig)
+def show_chart(fig):
+    st.plotly_chart(fig, theme=None, config=CONFIG)
 
 
-def outlook_chart(o, t_now: float) -> bytes:
-    """残り試験の平均点 t と総合成績の関係（一次関数）."""
-    fig, ax = plt.subplots(figsize=(6.5, 3.8))
-    shade_zones(ax, horizontal=False)
-    ax.plot([0, 100], [o.floor, o.ceiling], color="#1a237e", lw=2)
-    for need, line, color in [(o.need_retest, RETEST_LINE, "#ef6c00"),
-                              (o.need_pass, PASS_LINE, "#2e7d32")]:
-        if need is not None and need != float("inf"):
-            ax.plot([need, need], [0, line], ls="--", color=color, lw=1.2)
-            ax.plot([need], [line], "o", color=color)
-            ax.annotate(f"{need:.1f} 点", (need, line), textcoords="offset points",
-                        xytext=(6, -14), color=color, fontsize=9)
-    ax.plot([t_now], [o.at(t_now)], marker="*", markersize=16, color="#d81b60",
-            label=f"見込み {t_now:.0f} 点 → 総合 {o.at(t_now):.1f} 点")
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, 100)
-    ax.set_xlabel("残りの試験の平均点")
-    ax.set_ylabel("総合成績")
-    ax.grid(True, ls=":", alpha=0.6)
-    ax.legend(loc="upper left", fontsize=9)
-    return to_png(fig)
-
-
-def show_status(label: str, kind: str, score: float, prefix: str):
-    msg = f"{prefix}：**{score:.2f} 点** → {label}"
-    {"success": st.success, "warning": st.warning, "error": st.error}[kind](msg)
-
-
-# ---------------------------------------------------------------------------
-# 結果
-# ---------------------------------------------------------------------------
 st.divider()
-report_lines: list[str] = []
-pngs: list[bytes] = []
 
 if not pending:
     total, term_scores = compute(pattern, exams, assignments, ratio)
@@ -172,16 +107,16 @@ if not pending:
     for c, (term, s) in zip(mcols, term_scores.items()):
         c.metric(f"{term}の成績", f"{s:.2f} 点")
     mcols[-1].metric("総合成績", f"{total:.2f} 点")
-    show_status(label, kind, total, "総合成績")
+    say(kind, f"総合成績：**{total:.2f} 点** → {label}")
     if kind == "warning":
-        st.info(f"あと {PASS_LINE - total:.2f} 点で合格ラインでした。再試験に向けて準備しましょう。")
+        say("info", f"あと {PASS_LINE - total:.2f} 点で合格ラインでした。再試験に向けて準備しましょう。")
 
-    png = gauge(total)
-    st.image(png)
-    pngs.append(png)
+    fig = gauge(total)
+    show_chart(fig)
+    figures.append(("総合成績の位置", fig))
 
-    report_lines += [f"{t}の成績: {s:.2f} 点" for t, s in term_scores.items()]
-    report_lines += [f"総合成績: {total:.2f} 点", f"判定: {label}"]
+    results += [(f"{t}の成績", f"{s:.2f} 点") for t, s in term_scores.items()]
+    results += [("総合成績", f"{total:.2f} 点"), ("判定", label)]
 
 else:
     o = outlook(pattern, exams, pending, assignments, ratio)
@@ -195,84 +130,60 @@ else:
     st.caption("「平均◯点以上」は、残りの試験の平均点です。残りが1回ならその試験の点数です。")
 
     if o.need_pass is None:
-        st.success("残りの試験が0点でも総合成績は60点以上です。気を抜かずに受けましょう。")
-    elif o.need_pass == float("inf"):
-        if o.need_retest == float("inf"):
-            st.error("残りの試験が満点でも総合成績は40点に届きません。"
-                     "早めに担当の先生・担任の先生に相談してください。")
+        say("success", "残りの試験が0点でも総合成績は60点以上です。気を抜かずに受けましょう。")
+    elif math.isinf(o.need_pass):
+        if o.need_retest is not None and math.isinf(o.need_retest):
+            say("error", "残りの試験が満点でも総合成績は40点に届きません。"
+                         "早めに担当の先生・担任の先生に相談してください。")
+        elif o.need_retest is None:
+            say("warning", "残りの試験が満点でも60点には届きませんが、再試験の資格（40点以上）は"
+                           "すでに確保しています。残りの試験も全力で取り組み、再試験に備えましょう。")
         else:
-            st.warning("残りの試験が満点でも60点には届きません。"
-                       f"再試験の資格（40点以上）を確実に取りにいきましょう（{need_text(o.need_retest)}）。")
+            say("warning", "残りの試験が満点でも60点には届きません。"
+                           f"再試験の資格（40点以上）を確実に取りにいきましょう（**{need_text(o.need_retest)}**）。")
     else:
-        st.info(f"残りの試験で **{need_text(o.need_pass)}** を取れば合格です。")
+        say("info", f"残りの試験で **{need_text(o.need_pass)}** を取れば合格です。")
 
     st.subheader("見込みで試算する")
     t_now = st.slider("残りの試験で取れそうな平均点", 0, 100, 60, key="expect")
     predicted = o.at(t_now)
     label, kind = judge(predicted)
-    show_status(label, kind, predicted, f"平均 {t_now} 点のときの総合成績")
+    say(kind, f"残りの平均が {t_now} 点のときの総合成績：**{predicted:.2f} 点** → {label}")
 
-    png1 = gauge(predicted, o.floor, o.ceiling)
-    st.image(png1)
+    fig1 = gauge(predicted, o.floor, o.ceiling)
+    show_chart(fig1)
     st.caption(f"灰色の帯は取りうる総合成績の範囲（残り0点：{o.floor:.1f} 点 〜 残り満点：{o.ceiling:.1f} 点）")
-    png2 = outlook_chart(o, t_now)
+    fig2 = outlook_chart(o, t_now)
     with st.expander("残りの試験の点数と総合成績の関係（グラフ）"):
-        st.image(png2)
-    pngs += [png1, png2]
+        show_chart(fig2)
+        st.caption("線の上にカーソルを合わせる（スマホではタップする）と、その点数での総合成績が表示されます。")
+    figures += [("総合成績の位置（見込み）", fig1), ("残りの試験の点数と総合成績の関係", fig2)]
 
-    report_lines += [
-        f"未実施の試験: {'・'.join(pending)}",
-        f"合格(60点)に必要な点: {need_text(o.need_pass)}",
-        f"再試験資格(40点)に必要な点: {need_text(o.need_retest)}",
-        f"見込み平均 {t_now} 点の場合の総合成績: {predicted:.2f} 点（{label}）",
+    results += [
+        ("未実施の試験", "・".join(pending)),
+        ("合格（60点）に必要な点", need_text(o.need_pass)),
+        ("再試験の資格（40点）に必要な点", need_text(o.need_retest)),
+        ("取りうる総合成績の範囲", f"{o.floor:.2f} 〜 {o.ceiling:.2f} 点"),
+        (f"見込み（残り平均 {t_now} 点）の総合成績", f"{predicted:.2f} 点（{label}）"),
     ]
 
-
 # ---------------------------------------------------------------------------
-# PDF
+# HTML ダウンロード
 # ---------------------------------------------------------------------------
-def create_pdf() -> bytes:
-    buf = BytesIO()
-    p = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    y = h - 50
-    p.setFont("HeiseiKakuGo-W5", 20)
-    p.drawString(50, y, "成績シミュレーション結果")
-    y -= 35
-    p.setFont("HeiseiKakuGo-W5", 11)
-    p.drawString(50, y, f"試験パターン: {PATTERNS[pattern][0]}　筆記試験の割合: {paper_ratio}%")
-    y -= 25
-    for name in exam_names(pattern):
-        val = "未実施" if name in pending else f"{exams[name]:.0f} 点"
-        p.drawString(60, y, f"{name}: {val}")
-        y -= 17
-    for term in term_names(pattern):
-        p.drawString(60, y, f"{term}課題点: {assignments[term]:.1f} 点")
-        y -= 17
-    y -= 10
-    p.setFont("HeiseiKakuGo-W5", 13)
-    for line in report_lines:
-        p.drawString(50, y, line)
-        y -= 22
-    y -= 10
-    for png in pngs:
-        img = ImageReader(BytesIO(png))
-        iw, ih = img.getSize()
-        dw = 480
-        dh = dw * ih / iw
-        if y - dh < 40:
-            p.showPage()
-            y = h - 50
-        p.drawImage(img, 50, y - dh, width=dw, height=dh)
-        y -= dh + 15
-    p.setFont("HeiseiKakuGo-W5", 9)
-    p.drawString(50, 30, "※この結果は入力値にもとづく試算です。正式な成績は担当教員の評価によります。")
-    p.showPage()
-    p.save()
-    return buf.getvalue()
-
+html = build_html(
+    settings=[("試験のパターン", PATTERNS[pattern][0]),
+              ("筆記試験の割合", f"{paper_ratio} %"),
+              ("課題点の満点（各期）", f"{assignment_limit} 点")],
+    inputs=[(f"{n}試験", "未実施" if n in pending else f"{exams[n]:.0f} 点")
+            for n in exam_names(pattern)]
+           + [(f"{t}課題点", f"{assignments[t]:.1f} 点") for t in term_names(pattern)],
+    results=results,
+    verdicts=verdicts,
+    figures=figures,
+)
 
 st.divider()
-st.download_button("📄 結果をPDFでダウンロード", data=create_pdf(),
-                   file_name="grade_simulation.pdf", mime="application/pdf")
-st.caption("入力した点数はこの画面の中だけで計算に使われ、保存されません。")
+st.download_button("📄 結果をHTMLでダウンロード", data=html.encode("utf-8"),
+                   file_name="grade_simulation.html", mime="text/html")
+st.caption("ダウンロードしたファイルはブラウザで開けます。ファイル内の「印刷 / PDFで保存」から"
+           "PDF にもできます。入力した点数はこの画面の中だけで計算に使われ、保存されません。")
